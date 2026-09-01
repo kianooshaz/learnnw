@@ -1,0 +1,68 @@
+// greeter.proto — the entire service definition.
+//
+// ─── Anatomy of a .proto file ───────────────────────────────────────────────
+//
+// Protobuf is defined by .proto files. Three things happen at build time:
+//
+//  1. `protoc` parses this file.
+//  2. `protoc-gen-go` produces proto/greeter.pb.go: message types, getters,
+//     reflection metadata, and the raw file descriptor.
+//  3. `protoc-gen-go-grpc` produces proto/greeter_grpc.pb.go: a typed
+//     client stub, a server interface, and a registration helper.
+//
+// Both generators are run from the repository root, e.g.:
+//
+//   protoc --go_out=. --go-grpc_out=. greeter.proto
+//
+// ─── What each part means ───────────────────────────────────────────────────
+//
+
+syntax = "proto3";
+
+// `package` namespaces the generated Go types. Here it becomes
+// greet.v1 — a common convention (the v1 signals "version 1 of this
+// schema, may have a v2 later with breaking changes"). It also lets
+// `protoc` reference messages across .proto files in the same package.
+package greet.v1;
+
+// `option go_package = "..."` tells the generators what import path to
+// stamp into the generated Go file. It MUST match the directory you'd
+// commit the generated file into. We use this repo's own path so the
+// generated code is importable from inside this module.
+option go_package = "github.com/kianooshaz/grpc-from-scratch/proto";
+
+// ─── Messages ───────────────────────────────────────────────────────────────
+//
+// A message is a typed struct. Field tags (the `= 1`, `= 2`) are the
+// canonical field numbers and are part of the wire format: they're how
+// the encoder says "I mean field Name" on the wire. NEVER change them
+// once a schema ships — that's a breaking change even if the Go type
+// changes.
+
+// GreetRequest is what clients send to Greet.
+message GreetRequest {
+  string name = 1; // field number 1; Go getter: GetName().
+}
+
+// GreetResponse is what the server replies with.
+message GreetResponse {
+  string greeting = 1; // field number 1; Go getter: GetGreeting().
+}
+
+// ─── Service ────────────────────────────────────────────────────────────────
+//
+// A service is a set of named RPCs. Each RPC has:
+//   - one input message,
+//   - one output message,
+//   - and a "stream" modifier on either side (omitted here → unary RPC):
+//
+//     rpc Greet(GreetRequest) returns (GreetResponse);               // unary
+//     rpc Subscribe(Req) returns (stream Item);                      // server stream
+//     rpc Upload(stream Req) returns (Ack);                          // client stream
+//     rpc Chat(stream Req) returns (stream Item);                    // bidi
+//
+// Unary RPCs are the simplest: one request, one response. This file
+// declares one such RPC and that's the entire service surface.
+service GreetService {
+  rpc Greet(GreetRequest) returns (GreetResponse) {}
+}

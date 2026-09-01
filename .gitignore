@@ -1,0 +1,29 @@
+# Binaries / compiled output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bin/
+
+# Go build & test artifacts
+go.work
+go.work.sum
+
+# Editors & IDEs
+.idea/
+*.swp
+*.swo
+.vscode/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Env & local files
+.env
+.env.*
+!.env.example
