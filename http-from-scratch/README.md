@@ -1,9 +1,10 @@
 # http-from-scratch
 
-An incremental re-implementation of HTTP on top of raw TCP, one protocol
-version at a time. The goal is to *understand* what an HTTP server is
-actually doing on the wire — every byte, every header, every state
-machine — by writing it ourselves in a few hundred lines of Go.
+An incremental re-implementation of HTTP on top of raw TCP — and, at the
+end, over QUIC — one protocol version at a time. The goal is to
+*understand* what an HTTP server is actually doing on the wire — every
+byte, every header, every state machine — by writing it ourselves in a
+few hundred lines of Go.
 
 This README is a guided tour of the HTTP protocol itself, with pointers to
 the code that implements each stage.
@@ -33,7 +34,7 @@ top of that basic shape.
 
 ---
 
-## The four versions in this repo
+## The versions in this repo
 
 The codebase is organised so each version lives in its own directory and
 you can read them in order:
@@ -43,6 +44,7 @@ http-from-scratch/
 ├── http0.9/    ← start here: 50 lines, the whole protocol
 ├── http1/      ← HTTP/1.0: status line and headers
 ├── http1.1/    ← HTTP/1.1: persistent connections and chunked encoding
+├── http3/      ← HTTP/3: same semantics over QUIC streams
 └── internal/std/   ← contrast piece: real-world net/http patterns
 ```
 
@@ -244,10 +246,103 @@ is set. That's exactly what `net/http` does.
 
 - No multiplexing: a slow response blocks subsequent requests on the
   same connection. (HTTP/2 fixes this with binary framing and many
-  streams over one connection.)
+  streams over one connection; HTTP/3 — which this repo implements in
+  `http3/` — gets the same fix from QUIC streams, skipping HTTP/2
+  entirely.)
 - Header compression: redundant headers (User-Agent, Cookie, …) are
-  sent on every request. (HTTP/2 fixes this with HPACK.)
-- Plaintext only by default (unless you wrap it in TLS).
+  sent on every request. (HTTP/2 fixes this with HPACK; HTTP/3 uses
+  QPACK.)
+- Plaintext only by default (unless you wrap it in TLS). HTTP/3 has no
+  plaintext mode at all: TLS 1.3 is part of the QUIC handshake.
+
+---
+
+## HTTP/3 — `http3/`
+
+**Read `http3/server/server.go` for the stream state machine, then
+`http3/frames/frames.go` for the wire format.**
+
+HTTP/3 keeps the semantics of HTTP/1.1 — methods, status codes, headers,
+bodies — and replaces everything underneath. TCP is out; QUIC (RFC 9000)
+is in: UDP datagrams, TLS 1.3 built into the handshake, and *streams* as
+the unit of concurrency.
+
+### The protocol in one screen
+
+```
+client                                      server
+  │ ─── QUIC connect: UDP + TLS 1.3 ───►      │
+  │                                          │
+  │ ══ unidir stream ══► 0x00 (control)      │
+  │    SETTINGS { qpack max table cap: 0 }   │
+  │ ◄══ unidir stream ═══ 0x00 (control) ══  │
+  │                    SETTINGS { ... }      │
+  │                                          │
+  │ ══ bidi stream 0 ═════════════════►      │
+  │    HEADERS { :method GET, :path /hello,  │
+  │              :scheme https,              │
+  │              :authority localhost:4433 } │
+  │ ◄═════════════════════════════════════   │
+  │    HEADERS { :status 200,                │
+  │              content-type text/plain }   │
+  │    DATA "Hello, HTTP/3!\n"               │
+  │ ◄══ FIN ══════════════════════════════   │
+  │                                          │
+  │ ══ bidi stream 4 ═════════════════►      │  ← next request; never
+  │                                          │    blocked behind stream 0
+```
+
+One request = one client-initiated bidirectional stream. Alongside
+request streams, each peer opens a unidirectional *control stream*, and
+SETTINGS must be its first frame.
+
+### What changed since 1.1
+
+| Feature           | HTTP/1.1                        | HTTP/3                                    |
+| ----------------- | ------------------------------- | ----------------------------------------- |
+| Transport         | TCP (a byte stream)             | QUIC: UDP + TLS 1.3, streams              |
+| Message format    | text lines + CRLF               | binary frames (type + length + payload)   |
+| Concurrency       | sequential per connection       | many streams, no head-of-line blocking    |
+| Body framing      | Content-Length or chunked       | DATA frames + the stream FIN              |
+| Keep-alive        | negotiated via `Connection`     | inherent — streams on a live connection   |
+| Header compression| none                            | QPACK (static table + literals here)      |
+| Request "line"    | `GET /path HTTP/1.1`            | `:method`, `:path`, `:scheme`, `:authority` pseudo-headers |
+| Handshake cost    | 1 RTT (TCP) + TLS round-trips   | 1 RTT (QUIC = TLS combined); 0 on resumption |
+
+### What's hand-written vs. borrowed
+
+The TCP versions implement everything down to `net.Listen`. HTTP/3 can't
+be honest about that: QUIC *is* TLS 1.3 plus packet protection, and
+writing TLS from scratch is a different project. So the layering here is
+explicit:
+
+| Layer                          | Who writes it                          |
+| ------------------------------ | -------------------------------------- |
+| QUIC transport (packets, TLS, streams, flow control) | `quic-go` library — the stand-in for `net.Conn` |
+| Header compression (QPACK)     | `quic-go/qpack` library, dynamic table disabled |
+| Varint, frames, SETTINGS, control streams, stream→request mapping, error codes | **this repo, by hand (RFC 9114)** |
+
+That split mirrors the repo's philosophy shifted one layer up: the bytes
+we inspect frame by frame are the HTTP/3 frames, and
+`http3/frames/frames.go` decodes every one of them.
+
+### Where the HTTP/1.1 pain went
+
+- **Body framing is gone.** Every DATA frame self-describes its length
+  and the FIN ends the body. See `http3/response/response.go` — the
+  `Write` method writes a frame header and the bytes, and that's the
+  whole framing story. The 1.1 dance of buffering headers to decide
+  between Content-Length and chunked has no successor.
+- **Keep-alive is gone.** Requests are streams; the connection lives as
+  long as both peers want. `Server.handle` in `http3/server/server.go`
+  never closes a connection between requests.
+- **Head-of-line blocking is gone.** A slow handler on stream 0 cannot
+  delay stream 4 — each stream has its own goroutine and its own
+  flow control.
+- **The request line became headers.** Compare `readRequest` in
+  `http1.1/server/server.go` (cutting one text line on spaces) with
+  `requestFromFields` in `http3/server/server.go` (reading four
+  pseudo-headers out of a QPACK field section).
 
 ---
 
@@ -286,7 +381,14 @@ If you want to learn HTTP this way:
 8. `http1.1/chunked/chunked.go` — read `Body.Read` carefully.
 9. `http1.1/response/response.go` — note how `ChunkedEncoding` is
    picked.
-10. `internal/std/mux/mux_test.go` and `internal/std/server/server.go`
+10. `http3/frames/frames.go` — the varint and frame grammar; short and
+    self-contained.
+11. `http3/server/server.go` — `handleConn` (the two accept loops),
+    `sendControlStream`, `serveRequest`, and how pseudo-headers become
+    an `*http.Request`.
+12. `http3/response/response.go` — the Writer for which body framing
+    stopped being a problem.
+13. `internal/std/mux/mux_test.go` and `internal/std/server/server.go`
     — the "what real Go does" comparison.
 
 ---
@@ -298,6 +400,16 @@ If you want to learn HTTP this way:
 cd http0.9/cmd/example && go run .
 cd ../../http1/cmd/example && go run .
 cd ../../http1.1/cmd/example && go run .
+
+# HTTP/3: server on UDP :4433 (self-signed cert generated in memory)…
+cd ../http3/cmd/example && go run .
+
+# …then fetch from another shell with the repo's own client:
+go run . -get https://localhost:4433/hello
+go run . -get https://localhost:4433/stream
+
+# h3-capable curl builds also work (-k tolerates the demo certificate):
+curl --http3-only -k https://localhost:4433/hello
 
 # Probe the HTTP/0.9 server with curl:
 curl --http0.9 http://127.0.0.1:9000/this/is/a/test
@@ -321,9 +433,12 @@ go test -bench . ./internal/std/mux
 
 ## Requirements
 
-- Go 1.25+ (for the `signal.NotifyContext` and `bytes.Cut` patterns used
+- Go 1.26+ (for the `signal.NotifyContext` and `bytes.Cut` patterns used
   in the code, and for `http.Request.PathValue` used in the HTTP/1.1
   example).
+- The HTTP/3 packages depend on `github.com/quic-go/quic-go` and
+  `github.com/quic-go/qpack` (see `go.mod`); the UDP port must be
+  reachable for QUIC traffic.
 
 ## Further reading
 
@@ -331,5 +446,8 @@ go test -bench . ./internal/std/mux
 - RFC 7230, 7231, 7232, 7233, 7234, 7235 — HTTP/1.1 (now obsoleted by
   RFC 9110, but still the clearest write-up)
 - RFC 7540 — HTTP/2
+- RFC 9000 — QUIC: A UDP-Based Multiplexed and Secure Transport
+- RFC 9114 — HTTP/3
+- RFC 9204 — QPACK: Field Compression for HTTP/3
 - "Go Web Programming" chapters on `net/http` internals
 - Go blog: "HTTP/2 in Go" and "Routing improvements in Go 1.22"
